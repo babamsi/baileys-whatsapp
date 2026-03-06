@@ -10,9 +10,12 @@ app.use(express.json())
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY
+const SUPABASE_URL = 'https://rdbdiqghqdpqphdjpnwf.supabase.co'
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
 
 let sock = null
-const lastMsgKey = new Map() // stores last msg key per user for reactions
+const lastMsgKey = new Map()
+const sentContactCard = new Set() // track who already got the vCard
 
 // ── ElevenLabs STT ────────────────────────────────────────────────────────────
 async function transcribeAudio(buffer, mimeType) {
@@ -43,6 +46,50 @@ async function reverseGeocode(lat, lng) {
   } catch (e) {
     return `${lat.toFixed(5)}, ${lng.toFixed(5)}`
   }
+}
+
+// ── Upload image to Supabase storage ─────────────────────────────────────────
+async function uploadImageToSupabase(buffer, mimeType, filename) {
+  try {
+    const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg'
+    const path = `complaints/${Date.now()}_${filename || 'photo'}.${ext}`
+    await axios.post(
+      `${SUPABASE_URL}/storage/v1/object/complaint-photos/${path}`,
+      buffer,
+      {
+        headers: {
+          'apikey': SUPABASE_KEY,
+          'Authorization': `Bearer ${SUPABASE_KEY}`,
+          'Content-Type': mimeType,
+          'x-upsert': 'true'
+        },
+        timeout: 15000
+      }
+    )
+    return `${SUPABASE_URL}/storage/v1/object/public/complaint-photos/${path}`
+  } catch (e) {
+    console.error('❌ Image upload failed:', e.message)
+    return null
+  }
+}
+
+// ── Send contact card ─────────────────────────────────────────────────────────
+async function sendContactCard(to) {
+  const vcard = [
+    'BEGIN:VCARD',
+    'VERSION:3.0',
+    'FN:Orange Desserts',
+    'ORG:Orange Desserts;',
+    'TEL;type=CELL;type=VOICE;waid=254757588666:+254757588666',
+    'END:VCARD'
+  ].join('\n')
+  await sock.sendMessage(to, {
+    contacts: {
+      displayName: 'Orange Desserts',
+      contacts: [{ vcard }]
+    }
+  })
+  console.log(`📇 Sent contact card to ${to}`)
 }
 
 async function connectToWhatsApp() {
@@ -79,7 +126,16 @@ async function connectToWhatsApp() {
       const from = msg.key.remoteJid
       if (from.endsWith('@g.us')) continue
 
-      lastMsgKey.set(from, msg.key) // track for reactions
+      // ── Read receipt (blue ticks) ─────────────────────────────────────────
+      await sock.readMessages([msg.key])
+
+      lastMsgKey.set(from, msg.key)
+
+      // ── Contact card on first message ─────────────────────────────────────
+      if (!sentContactCard.has(from)) {
+        sentContactCard.add(from)
+        try { await sendContactCard(from) } catch (e) { /* non-critical */ }
+      }
 
       let text = msg.message.conversation
         || msg.message.extendedTextMessage?.text
@@ -89,6 +145,23 @@ async function connectToWhatsApp() {
       let isVoice = false
       let isLocation = false
       let locationData = null
+      let imageUrl = null
+
+      // ── Image message → upload to Supabase ───────────────────────────────
+      if (msg.message.imageMessage) {
+        try {
+          console.log(`📸 Image from ${from} — downloading...`)
+          const buffer = await downloadMediaMessage(
+            msg, 'buffer', {},
+            { logger: require('pino')({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+          )
+          const mime = msg.message.imageMessage.mimetype || 'image/jpeg'
+          imageUrl = await uploadImageToSupabase(buffer, mime, from.split('@')[0])
+          if (imageUrl) console.log(`📸 Uploaded: ${imageUrl}`)
+        } catch (err) {
+          console.error('❌ Image download failed:', err.message)
+        }
+      }
 
       // ── Voice note → ElevenLabs STT ──────────────────────────────────────
       if (!text && (msg.message.audioMessage || msg.message.pttMessage)) {
@@ -99,7 +172,6 @@ async function connectToWhatsApp() {
         }
         try {
           console.log(`🎤 Voice note from ${from} — downloading...`)
-          await sock.readMessages([msg.key])
           const buffer = await downloadMediaMessage(
             msg, 'buffer', {},
             { logger: require('pino')({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
@@ -127,10 +199,14 @@ async function connectToWhatsApp() {
         console.log(`📍 Resolved: "${address}"`)
       }
 
+      // if image with no caption, send placeholder text so agent knows
+      if (!text && imageUrl) text = '[Customer sent a photo]'
+
       if (!text) continue
 
       console.log(`📨 From ${from}: ${text}`)
       try {
+        await sock.sendPresenceUpdate('composing', from)
         await axios.post(N8N_WEBHOOK_URL, {
           from,
           message: text,
@@ -139,10 +215,14 @@ async function connectToWhatsApp() {
           pushName: msg.pushName || '',
           isVoice,
           isLocation,
+          hasImage: !!imageUrl,
+          imageUrl: imageUrl || null,
           ...(locationData && { location: locationData })
         })
+        await sock.sendPresenceUpdate('paused', from)
         console.log(`✅ Forwarded to n8n`)
       } catch (err) {
+        await sock.sendPresenceUpdate('paused', from)
         console.error('❌ n8n forward failed:', err.message)
       }
     }
@@ -223,6 +303,9 @@ app.listen(PORT, () => {
   console.log('📍 Location sharing: enabled (Nominatim)')
   console.log('📣 Status notifications: enabled (/notify)')
   console.log('👍 Reactions: enabled (/react)')
+  console.log('📇 Contact card: enabled (first message)')
+  console.log('👁️  Read receipts: enabled')
+  console.log('📸 Image upload: enabled (Supabase)')
 })
 
 connectToWhatsApp()
