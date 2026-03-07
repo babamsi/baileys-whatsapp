@@ -15,7 +15,7 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
 
 let sock = null
 const lastMsgKey = new Map()
-const sentContactCard = new Set() // track who already got the vCard
+const sentContactCard = new Set()
 
 // ── ElevenLabs STT ────────────────────────────────────────────────────────────
 async function transcribeAudio(buffer, mimeType) {
@@ -137,9 +137,12 @@ async function connectToWhatsApp() {
         try { await sendContactCard(from) } catch (e) { /* non-critical */ }
       }
 
+      // ── Extract text — including button/list tap responses ────────────────
       let text = msg.message.conversation
         || msg.message.extendedTextMessage?.text
         || msg.message.imageMessage?.caption
+        || msg.message.buttonsResponseMessage?.selectedDisplayText
+        || msg.message.listResponseMessage?.singleSelectReply?.selectedRowId
         || ''
 
       let isVoice = false
@@ -229,7 +232,7 @@ async function connectToWhatsApp() {
   })
 }
 
-// ── Send reply (called by n8n) ────────────────────────────────────────────────
+// ── Send plain text reply (called by n8n) ────────────────────────────────────
 app.post('/send', async (req, res) => {
   const { to, message } = req.body
   if (!to || !message) return res.status(400).json({ error: 'Missing to or message' })
@@ -241,6 +244,40 @@ app.post('/send', async (req, res) => {
   } catch (err) {
     console.error('❌ Send failed:', err.message)
     res.status(500).json({ error: err.message })
+  }
+})
+
+// ── Send button message (called by n8n) ──────────────────────────────────────
+// buttons: [{ id: 'mpesa', text: 'M-Pesa' }, { id: 'cash', text: 'Cash' }]
+app.post('/send-buttons', async (req, res) => {
+  const { to, text, footer, buttons } = req.body
+  if (!to || !text || !buttons?.length) return res.status(400).json({ error: 'Missing to, text, or buttons' })
+  if (!sock) return res.status(503).json({ error: 'WhatsApp not connected' })
+  try {
+    const btns = buttons.map(b => ({
+      buttonId: b.id,
+      buttonText: { displayText: b.text },
+      type: 1
+    }))
+    await sock.sendMessage(to, {
+      buttons: btns,
+      text,
+      footer: footer || 'Orange Desserts',
+      headerType: 1
+    })
+    console.log(`🔘 Buttons sent to ${to}: ${buttons.map(b => b.text).join(' | ')}`)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('❌ Buttons failed:', err.message)
+    // Fallback to plain text if buttons are blocked
+    try {
+      const fallback = text + '\n\n' + buttons.map(b => b.text).join(' / ')
+      await sock.sendMessage(to, { text: fallback })
+      console.log(`📤 Button fallback sent to ${to}`)
+      res.json({ success: true, fallback: true })
+    } catch (e) {
+      res.status(500).json({ error: e.message })
+    }
   }
 })
 
@@ -291,7 +328,8 @@ app.get('/health', (_, res) => {
   res.json({
     status: 'ok',
     whatsapp: sock ? 'connected' : 'disconnected',
-    elevenlabs: ELEVENLABS_API_KEY ? 'configured' : 'missing'
+    elevenlabs: ELEVENLABS_API_KEY ? 'configured' : 'missing',
+    supabase: SUPABASE_KEY ? 'configured' : 'missing'
   })
 })
 
@@ -303,9 +341,10 @@ app.listen(PORT, () => {
   console.log('📍 Location sharing: enabled (Nominatim)')
   console.log('📣 Status notifications: enabled (/notify)')
   console.log('👍 Reactions: enabled (/react)')
+  console.log('🔘 Button messages: enabled (/send-buttons)')
   console.log('📇 Contact card: enabled (first message)')
   console.log('👁️  Read receipts: enabled')
-  console.log('📸 Image upload: enabled (Supabase)')
+  console.log('📸 Image upload: enabled (Supabase complaint-photos)')
 })
 
 connectToWhatsApp()
